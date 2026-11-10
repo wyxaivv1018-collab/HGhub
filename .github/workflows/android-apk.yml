@@ -1,0 +1,108 @@
+name: Build Android APK
+
+# 只跑 arm64，产出可直接安装的签名 APK，并挂到 Release 方便下载。
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/android-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Android APK (arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # ubuntu runner 自带 Android SDK；这里补齐 platform / build-tools / NDK。
+      - name: 准备 Android SDK / NDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          ls "$SDK/ndk"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android-arm64
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 生成 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 编译 APK
+        run: pnpm tauri android build --apk --target aarch64
+
+      # 用一次性自签证书签名，不依赖任何 secret；证书一并带出，后续升级要用同一份。
+      - name: 签名 APK
+        run: |
+          set -euo pipefail
+          KS="$RUNNER_TEMP/hghub.keystore"
+          PASS='hghub-20261110'
+          keytool -genkeypair -v -keystore "$KS" -alias hghub \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -dname "CN=HGhub, OU=Personal, O=Personal, L=Zhuhai, ST=Guangdong, C=CN"
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BT/apksigner"
+          mkdir -p out
+          found=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk'); do
+            echo "unsigned: $f"
+            "$APKSIGNER" sign --ks "$KS" --ks-key-alias hghub \
+              --ks-pass "pass:$PASS" --key-pass "pass:$PASS" \
+              --v4-signing-enabled false \
+              --out out/HGhub-1.2.1-arm64.apk "$f"
+            found=$((found+1))
+          done
+          [ "$found" -gt 0 ] || { echo "::error::没有找到 APK"; exit 1; }
+          "$APKSIGNER" verify --print-certs out/HGhub-1.2.1-arm64.apk | head -6
+          cp "$KS" out/hghub-release.keystore
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hghub-apk
+          path: out/*
+          if-no-files-found: error
+
+      - name: 挂到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-v1.2.1
+          name: HGhub 1.2.1 · Android APK (arm64)
+          body: |
+            自签 arm64 APK，从 v1.2.1 源码构建（已含官方播放接口修复）。
+            安装需允许「未知来源」。包内附带签名证书，升级请用同一份证书签名。
+          files: out/*
+          token: ${{ secrets.GITHUB_TOKEN }}
